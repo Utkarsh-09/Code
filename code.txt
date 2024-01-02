@@ -1,0 +1,333 @@
+import json
+import os
+import sys
+import shutil
+from unittest import TestLoader
+import streamlit as st
+
+import boto3
+import tempfile
+
+module_path = ".."
+sys.path.append(os.path.abspath(module_path))
+from utils import bedrock, print_ww
+from urllib.request import urlretrieve, urlopen
+import urllib.request
+import ssl
+import numpy as np
+from PIL import Image
+import pickle
+from langchain.text_splitter import CharacterTextSplitter, RecursiveCharacterTextSplitter
+from langchain.document_loaders import PyPDFLoader, PyPDFDirectoryLoader
+from langchain.chains.question_answering import load_qa_chain
+from langchain.vectorstores import FAISS
+from langchain.indexes import VectorstoreIndexCreator
+from langchain.indexes.vectorstore import VectorStoreIndexWrapper
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain.schema import BaseMessage
+from langchain.embeddings import BedrockEmbeddings
+from langchain.llms.bedrock import Bedrock
+from langchain.document_loaders import TextLoader
+
+boto3_bedrock = bedrock.get_bedrock_client(
+    assumed_role=os.environ.get("BEDROCK_ASSUME_ROLE", None),
+    endpoint_url=os.environ.get("BEDROCK_ENDPOINT_URL", None),
+    region=os.environ.get("AWS_DEFAULT_REGION", None),
+)
+
+# Initialize session state variables if they don't exist
+if 'temp_dir' not in st.session_state:
+    st.session_state.temp_dir = tempfile.mkdtemp()
+
+# Initialize session state variables if they don't exist
+if 'processed_documents' not in st.session_state:
+    st.session_state.processed_documents = []
+
+if 'vectorstore_faiss' not in st.session_state:
+    st.session_state.vectorstore_faiss = None
+
+if 'uploaded_files_set' not in st.session_state:
+    st.session_state.uploaded_files_set = set()
+
+if 'directory_processed' not in st.session_state:
+    st.session_state.directory_processed = False
+
+# Vectorstore cache file
+VECTORSTORE_CACHE_FILE = "vectorstore.pkl"
+
+if 'chat_history' not in st.session_state:
+    st.session_state.chat_history = []
+
+if 'selected_heading' not in st.session_state:
+    st.session_state.selected_heading = None
+
+@st.cache(allow_output_mutation=True)
+def load_vectorstore():
+    """Load cached vectorstore if exists, otherwise create new one"""
+    if os.path.exists(VECTORSTORE_CACHE_FILE):
+        with open(VECTORSTORE_CACHE_FILE, "rb") as f:
+            return pickle.load(f) 
+    else:
+        # Create new vectorstore
+        documents = [] # Load docs
+        embedding_fn = BedrockEmbeddings()  
+        vs = FAISS.from_documents(documents, embedding_fn)  
+        save_vectorstore(vs)
+        return vs
+
+@st.cache
+def save_vectorstore(vs):
+    """Serialize vectorstore object for caching"""
+    with open(VECTORSTORE_CACHE_FILE, "wb") as f:
+        pickle.dump(vs, f)
+
+def process_documents(documents):
+    """Process new documents and add to vectorstore"""
+    vs = load_vectorstore()
+    
+    # Process documents
+    # Add to vectorstore
+    vs.add_documents(documents) 
+    
+    save_vectorstore(vs)
+
+_ROLE_MAP = {"human": "\n\nHuman: ", "ai": "\n\nAssistant: "}
+def _get_chat_history(chat_history):
+    buffer = ""
+    for dialogue_turn in chat_history:
+        if isinstance(dialogue_turn, BaseMessage):
+            role_prefix = _ROLE_MAP.get(dialogue_turn.type, f"{dialogue_turn.type}: ")
+            buffer += f"\n{role_prefix}{dialogue_turn.content}"
+        else:
+            raise ValueError(
+                f"Unsupported chat history format: {type(dialogue_turn)}."
+                f" Full chat history: {chat_history} "
+            )
+    return buffer
+
+def process_file(uploaded_file, file_type):
+    with st.spinner(f'Processing {uploaded_file.name}...'):
+        file_extension = os.path.splitext(uploaded_file.name)[1]
+        temp_filepath = f"temp_file.{file_type}"
+        with open(temp_filepath, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        
+        # Load the documents
+        if file_type == 'pdf':
+            loader = PyPDFLoader(temp_filepath)
+        elif file_type == 'plain':
+            loader = TextLoader(temp_filepath)
+        else:
+            raise ValueError("Unsupported file type")
+        
+        documents = loader.load()
+        
+        # Text splitting
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        new_processed_documents = text_splitter.split_documents(documents)
+        
+        # Extend session state processed documents
+        st.session_state.processed_documents.extend(new_processed_documents)
+        
+        # Embeddings
+        bedrock_embeddings = BedrockEmbeddings(client=boto3_bedrock)
+        
+        if st.session_state.vectorstore_faiss is None:
+            st.session_state.vectorstore_faiss = FAISS.from_documents(
+                new_processed_documents,
+                bedrock_embeddings,
+            )
+        else:
+            new_vectorstore_faiss = FAISS.from_documents(
+                new_processed_documents,
+                bedrock_embeddings,
+            )
+            st.session_state.vectorstore_faiss.merge(new_vectorstore_faiss)
+
+def process_directory(directory_path):
+    with st.spinner(f'Processing your files...'):
+        # Load all documents from the directory first
+        documents = []
+
+        for filename in os.listdir(directory_path):
+            file_path = os.path.join(directory_path, filename)
+            file_extension = os.path.splitext(filename)[1].lower()
+
+            if file_extension == ".pdf":
+                loader = PyPDFLoader(file_path)
+            elif file_extension == ".txt":
+                loader = TextLoader(file_path)
+            elif file_extension == ".cbl":
+                loader = TextLoader(file_path)
+            else:
+                continue  # Skip any other files
+
+            documents.extend(loader.load())
+
+        # Text splitting on the aggregated documents
+        text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        new_processed_documents = text_splitter.split_documents(documents)
+            
+        # Extend session state processed documents
+        st.session_state.processed_documents.extend(new_processed_documents)
+            
+        # Embeddings
+        bedrock_embeddings = BedrockEmbeddings(client=boto3_bedrock)
+        print(bedrock_embeddings)
+            
+        if st.session_state.vectorstore_faiss is None:
+            st.session_state.vectorstore_faiss = FAISS.from_documents(
+                new_processed_documents,
+                bedrock_embeddings,
+            )
+        else:
+            new_vectorstore_faiss = FAISS.from_documents(
+                new_processed_documents,
+                bedrock_embeddings,
+            )
+        print(st.session_state.vectorstore_faiss)
+            # st.session_state.vectorstore_faiss.merge(new_vectorstore_faiss)
+
+
+
+llm = Bedrock(model_id="anthropic.claude-v2", client=boto3_bedrock, model_kwargs={'max_tokens_to_sample':8190})
+
+
+def get_answer(query):
+    with st.spinner('Fetching your answer...'):
+        if llm is None or st.session_state.vectorstore_faiss is None:
+            raise ValueError("Upload files first")
+            # raise ValueError("Language model or vector store not initialized")
+        
+        query_embedding = st.session_state.vectorstore_faiss.embedding_function(query)
+        relevant_documents = st.session_state.vectorstore_faiss.similarity_search_by_vector(query_embedding)
+        st.write(f'{len(relevant_documents)} documents are fetched which are relevant to the query.')
+        print('----')
+        for i, rel_doc in enumerate(relevant_documents):
+            print_ww(f'## Document {i+1}: {rel_doc.page_content}.......')
+            print('---')
+        wrapper_store_faiss = VectorStoreIndexWrapper(vectorstore=st.session_state.vectorstore_faiss)
+        answer = wrapper_store_faiss.query(question=query, llm=llm)
+        
+        return answer, relevant_documents
+    
+def update_question():
+    selected_prompt = prompts[selected_heading]
+    st.session_state.user_question = selected_prompt
+    handle_userinput(selected_prompt)
+
+def handle_userinput(user_question):
+    if 'qa_chain' in st.session_state:
+        try:
+            response = st.session_state.qa_chain({'question': user_question})
+            # Append question and answer to the chat history
+            st.session_state.chat_history.append(f"You: {user_question}")
+            st.session_state.chat_history.append(f"Bot: {response['answer']}")
+        except Exception as e:
+            st.error("Error processing the query: " + str(e))
+    else:
+        st.error("Upload files to get started.")
+    
+# Load and display the image in the sidebar
+with st.sidebar:
+    image_path = 'Sun-Life-Financial.png'  # Replace with the path to your image
+    image = Image.open(image_path)
+    st.image(image, use_column_width=True)
+
+    uploaded_files = st.file_uploader("Choose PDF or TXT files", type=["pdf", "txt", "cbl"], accept_multiple_files=True)
+
+    # Dropdown menu with prompts
+    prompts = {
+        "Heading 1": "summarize the code",
+        "Heading 2": "Prompt 2",
+        # Add more headings and prompts as needed
+    }
+    selected_heading = st.selectbox("Choose a topic:", prompts.keys(), index=0, on_change=update_question)
+
+    if selected_heading != st.session_state.selected_heading:
+        st.session_state.selected_heading = selected_heading
+        user_question = prompts[selected_heading]
+        st.session_state.user_question = user_question
+        handle_userinput(user_question)
+
+st.title("Report Automation")
+
+# Define the function to reset input
+def reset_input():
+    st.session_state.user_question = ""
+
+
+# Conditional initialization of qa_chain
+if 'qa_chain' not in st.session_state:
+    if st.session_state.vectorstore_faiss is not None:
+        memory_chain = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
+        st.session_state.qa_chain = ConversationalRetrievalChain.from_llm(
+            llm=llm, 
+            retriever=st.session_state.vectorstore_faiss.as_retriever(), 
+            memory=memory_chain,
+            get_chat_history=_get_chat_history,
+            # Other configurations...
+        )
+    else:
+        st.error("Vector Database is not initialized.")
+
+# Function to handle user input
+
+
+
+
+if uploaded_files and not st.session_state.directory_processed:
+    st.success(f"Uploaded {len(uploaded_files)} files successfully!")
+
+    for uploaded_file in uploaded_files:
+        if uploaded_file.name not in st.session_state.uploaded_files_set:
+            file_path = os.path.join(st.session_state.temp_dir, uploaded_file.name)
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            st.session_state.uploaded_files_set.add(uploaded_file.name)
+    
+    # After all files are uploaded and saved, process the directory
+    process_directory(st.session_state.temp_dir)
+    st.session_state.directory_processed = True
+
+elif not st.session_state.directory_processed:
+    st.warning("0 files uploaded.")
+
+else:
+    st.success(f"Uploaded {len(uploaded_files)} files successfully!")
+
+
+
+user_question = st.text_input("Enter your query", key="user_question")
+
+# Process user input
+if st.button("Submit"):
+    if user_question:
+        handle_userinput(user_question)
+        # Clear the input box after submission
+    else:
+        st.warning("Please enter a question.")
+
+# Display conversation history
+# st.write("Conversation History:")
+for message in st.session_state.chat_history:
+    with st.chat_message("user"):
+        st.write(message)
+
+
+    
+# query = st.text_area("Enter your query:")
+        
+# if st.button("Get Answer"):
+#     if query:
+#         answer, relevant_documents = get_answer(query)
+#         st.write("Answer:", answer) 
+#         st.write("Relevant Documents")
+#         for i, rel_doc in enumerate(relevant_documents):
+#             st.write(f'## Document {i+1}: {rel_doc.page_content}.......')
+
+#     else:
+#         st.warning("Please enter a query.")
+
+
