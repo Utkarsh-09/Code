@@ -1,0 +1,551 @@
+import React, { useEffect, useState, useRef } from "react";
+import "../style/pages/GptPlayground.scss";
+import send from "../assets/send-icon.svg";
+import account from "../assets/account-24px.svg";
+import response from "../assets/logo-24.svg";
+
+import infoicon from "../assets/info-icon.svg";
+import contenteditor from "../assets/content-editor.svg";
+import menuIcon from "../assets/menu-icon.svg";
+import copy from "../assets/copy.svg";
+import llmIcon from "../assets/prescription-24px.svg";
+import { Dropdown, Progress } from "@sunlife/ui-components-react";
+import axios from "axios";
+import useUndoableState from "../customHook/useUndoableState";
+import i18 from "../i18n";
+import Context from "../components/Context";
+import Image from "../components/Image";
+import { ModalComponent } from "../components/ModalComponent";
+import Sidebar from "../components/Sidebar";
+import useIsMobile from "../customHook/useIsMobile";
+import LLMdata from "../assets/data/llm.json";
+
+const GptPlayground = (accessToken) => {
+  const [title, setTitle] = useState("untitledThread");
+  const [chatList, setChatList] = useState([]);
+  const [output, setOutput] = useState([]);
+  const [showTyping, setShowTyping] = useState(false);
+  const [promptText, setPromptText] = useState("");
+  const [isLoading, setIsLoading] = useState(false);
+  const [selectedLlm, setSelectedLlm] = useState({});
+  const [llmList, setLlmList] = useState([]);
+  const messagesEndRef = useRef(null);
+  const token = accessToken.accessToken;
+  const translate = i18.t;
+  const [modalShow, setModalShow] = useState(false);
+  const [showError, setShowError] = useState(false);
+  const [showContextEditor, setShowContextEditor] = useState(true);
+  const isMobile = useIsMobile();
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  };
+
+  const setContext = () => {
+    setShowContextEditor(!showContextEditor);
+  };
+
+  const effectRendered = useRef(false);
+  const getConfig = () => {
+    setModalShow(false);
+    handleNewChat();
+    setIsLoading(true);
+    if (LLMdata) {
+      const active = LLMdata.filter((x) => {
+        return (
+          x.active &&
+          x.vendor_name === "anthropic" &&
+          x.model_name !== "claude-v1"
+        );
+      });
+      setLlmList(active);
+      setSelectedLlm(active[0]);
+      setIsLoading(false);
+      setShowError(false);
+    } else {
+      setIsLoading(false);
+      setModalShow(true);
+      setShowError(true);
+    }
+
+    // axios
+    //   .get(`/gpt-playground-api/config`, {
+    //     headers: {
+    //       Authorization: `Bearer ${token}`,
+    //     },
+    //   })
+    //   .then((response) => {
+    //     const active = response.data.filter((x) => {
+    //       return (
+    //         x.active &&
+    //         x.vendor_name === "anthropic" &&
+    //         x.model_name !== "claude-v1"
+    //       );
+    //     });
+    //     setLlmList(active);
+    //     setSelectedLlm(active[0]);
+    //     setIsLoading(false);
+    //     setShowError(false);
+    //   })
+    //   .catch(() => {
+    //     console.log(selectedLlm);
+    //     setIsLoading(false);
+    //     setModalShow(true);
+    //     setShowError(true);
+    //   });
+  };
+  useEffect(() => {
+    setTimeout(() => {
+      const chatArea = document.getElementById("chatArea");
+      const marginBottom = window
+        .getComputedStyle(chatArea)
+        .getPropertyValue("margin-bottom");
+      const height = chatArea.offsetHeight;
+      if (chatArea && marginBottom && height) {
+        const maxHeight = height + parseInt(marginBottom) - 10;
+        chatArea.style.maxHeight = maxHeight + "px";
+      }
+    }, 500);
+
+    if (isMobile) {
+      setContext();
+    }
+    if (effectRendered.current === false) {
+      setTitle(translate("untitledThread"));
+      if (token) {
+        getConfig();
+      }
+      return () => {
+        effectRendered.current = true;
+      };
+    }
+  }, [token]);
+
+  const closeModal = () => {
+    setModalShow(false);
+  };
+
+  const postPrompt = async () => {
+    const data = {
+      model_id: selectedLlm.id,
+      locale: "en_US",
+      session_id: "brtqufds2kpmypt3wbqx3r",
+      model_name: selectedLlm.model_name,
+      model_type: selectedLlm.model_type,
+      vendor_name: selectedLlm.vendor_name,
+      prompt: promptText,
+      context: doc.text,
+    };
+
+    return axios.post(`/gpt-playground-api/llm`, data, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+  };
+
+  const handleChatSelected = (title) => {
+    handleNewChat();
+    setTitle(title);
+    const chat = chatList.find((data) => {
+      return data.title.indexOf(title) > -1;
+    });
+    setOutput(chat.chatOutput);
+  };
+
+  const handleTitleChange = (e) => {
+    setTitle(e.target.value);
+  };
+
+  const handleNewChat = async () => {
+    setShowTyping(false);
+    setOutput([]);
+    setTitle("Untitled Thread");
+    setPromptText("");
+    resetDoc(init);
+  };
+
+  const handleSend = async () => {
+    const prompt = promptText;
+
+    setPromptText("");
+    let chatOutput = {
+      type: "user",
+      response: prompt,
+    };
+    setOutput((current) => [...current, chatOutput]);
+    setShowTyping(true);
+
+    setTimeout(() => {
+      scrollToBottom();
+    });
+    postPrompt()
+      .then((data) => {
+        chatOutput = {
+          type: "reponse",
+          llm: selectedLlm.model_name,
+          response: data.data,
+        };
+        setOutput((current) => [...current, chatOutput]);
+        setShowTyping(false);
+
+        if (output.length === 0) {
+          setTitle(prompt);
+          const userChat = {
+            type: "user",
+            response: prompt,
+          };
+
+          const chat = {
+            title: prompt,
+            chatOutput: [userChat, chatOutput],
+          };
+
+          setChatList((current) => [chat, ...current]);
+        } else {
+          const outputIndex = chatList.findIndex((data) => {
+            return data.title.indexOf(title) > -1;
+          });
+          const userChat = {
+            type: "user",
+            response: prompt,
+          };
+          chatList[outputIndex].chatOutput.push(userChat);
+          chatList[outputIndex].chatOutput.push(chatOutput);
+        }
+      })
+      .catch((err) => {
+        err && setShowTyping(false) && scrollToBottom();
+      });
+  };
+
+  const handlePromptChange = (ev) => {
+    setPromptText(ev.target.value);
+  };
+
+  const handleKeyDown = (e) => {
+    if (e.keyCode === 13) {
+      e.preventDefault();
+      if (selectedLlm.id) {
+        handleSend();
+      }
+    }
+  };
+
+  const init = { text: "" };
+  const {
+    state: doc,
+    setState: setDoc,
+    resetState: resetDoc,
+    index: docStateIndex,
+    lastIndex: docStateLastIndex,
+    goBack: undoDoc,
+    goForward: redoDoc,
+  } = useUndoableState(init);
+  const canUndo = docStateIndex > 0;
+  const canRedo = docStateIndex < docStateLastIndex;
+
+  return (
+    <div className="main-content">
+      <Progress
+        id="determinate-in-backdrop"
+        label="Just a moment while we get things ready for you..."
+        variant="indeterminate"
+        color="light"
+        backdrop={true}
+        open={isLoading}
+      />
+
+      {!isMobile ? (
+        <Sidebar
+          handleNewChat={handleNewChat}
+          chatList={chatList}
+          handleChatSelected={handleChatSelected}
+        />
+      ) : (
+        <div
+          className="offcanvas offcanvas-start side-bar-canvass"
+          data-bs-backdrop="static"
+          tabIndex="-1"
+          id="staticBackdrop"
+          aria-labelledby="staticBackdropLabel"
+        >
+          <Sidebar
+            handleNewChat={handleNewChat}
+            chatList={chatList}
+            handleChatSelected={handleChatSelected}
+          />
+        </div>
+      )}
+      <div className="gpt-area">
+        <div className="header">
+          <div
+            className={isMobile ? "header-content-mobile" : "header-content"}
+          >
+            {isMobile && (
+              <button
+                type="button"
+                className="btn btn-light"
+                data-bs-toggle="offcanvas"
+                data-bs-target="#staticBackdrop"
+                aria-controls="staticBackdrop"
+              >
+                <Image source={menuIcon} altText={"Menu"} />
+              </button>
+            )}
+            <input
+              readOnly
+              type="text"
+              className="title flex-fill"
+              value={title}
+              onChange={handleTitleChange}
+            />
+          </div>
+          {isMobile && (
+            <div className="context-editor" hidden={showContextEditor}>
+              <button
+                className="btn btn-link editor-btn"
+                type="button"
+                data-bs-toggle="collapse"
+                data-bs-target="#collapseWidthExample"
+                aria-expanded="false"
+                aria-controls="collapseWidthExample"
+                onClick={setContext}
+              >
+                <Image source={contenteditor} alt="Context Editor" />
+                <p className="body-xs m-0">Context Editor</p>
+              </button>
+            </div>
+          )}
+        </div>
+        <div className="body">
+          <div
+            className="body-content-left"
+            hidden={showContextEditor && isMobile}
+          >
+            <div className="left-chat">
+              <div className="welcome-msg">
+                <div className="body">
+                  <Image source={infoicon} alt="Info" />
+                  <div>
+                    <div className={isMobile ? "h4" : "title-text"}>
+                      {translate("welcomeBanner")}
+                    </div>
+                    <p className="body-small m-0">
+                      {translate("welcomeBannerMessage")}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              {showError && (
+                <div className="errorBanner">
+                  <div className="body">
+                    <i
+                      className="fal fa-exclamation-triangle error"
+                      aria-hidden="true"
+                    ></i>
+                    <div className="message">
+                      <p className="body-small m-0">
+                        {translate("errorBannerMessage")}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div
+                id="chatArea"
+                className={`chat-area mb-auto ${
+                  isMobile ? "chat-height-mobile" : "chat-height"
+                }`}
+              >
+                <div className="chat-container">
+                  {!showError && (
+                    <div className="response">
+                      <div className="response-icon">
+                        <Image
+                          source={response}
+                          alt="Response"
+                          className=""
+                          sizes="24"
+                        />
+                      </div>
+                      <div className="response-container">
+                        <label className="label-md-bold">
+                          {translate("welcomeText")}
+                        </label>
+                      </div>
+                    </div>
+                  )}
+                  {output.map((data) => {
+                    return (
+                      <div
+                        key={data.response}
+                        className={
+                          data.type === "user" ? "user-prompt" : "response"
+                        }
+                      >
+                        <div
+                          className={
+                            data.type === "user" ? "user-icon" : "response-icon"
+                          }
+                        >
+                          <Image
+                            source={data.type === "user" ? account : response}
+                            alt="Response"
+                            className=""
+                            sizes="24"
+                          />
+                        </div>
+                        <div className="response-container">
+                          {data.type === "reponse" && (
+                            <label className="label-md-bold">{data.llm}</label>
+                          )}
+
+                          <pre className="response-text">{data.response}</pre>
+
+                          {data.type === "reponse" && (
+                            <div className="icon-container">
+                              <button
+                                type="button"
+                                className="btn btn-link copy"
+                                onClick={() => {
+                                  navigator.clipboard.writeText(data.response);
+                                }}
+                              >
+                                <Image
+                                  source={copy}
+                                  alt="Copy"
+                                  className="mx-2"
+                                />
+
+                                {translate("Copy")}
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+
+                  <div className="py-4" ref={messagesEndRef} />
+                  {showTyping && (
+                    <div className="typing-div">
+                      <div className="chat-bubble">
+                        <div className="typing">
+                          <div className="dot"></div>
+                          <div className="dot"></div>
+                          <div className="dot"></div>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="prompt-area">
+                <textarea
+                  className="input-box"
+                  onChange={(event) => handlePromptChange(event)}
+                  onKeyDown={handleKeyDown}
+                  value={promptText}
+                  placeholder={translate("prompt")}
+                />
+                <div className="prompt-options">
+                  {showError && (
+                    <div className="llmWrapper">
+                      <i
+                        className="far fa-exclamation-circle error"
+                        aria-hidden="true"
+                      ></i>
+                      <p className="body-xs-bold error px-2">
+                        {translate("somethingWentWrong")}
+                        {", "}
+                        {translate("please")}{" "}
+                        <span className="tryAgain" onClick={getConfig}>
+                          {translate("tryAgain")}
+                        </span>
+                        .
+                      </p>
+                    </div>
+                  )}{" "}
+                  {!showError && (
+                    <div className="llmWrapper">
+                      <Image source={llmIcon} alt="LLM" />
+                      <Dropdown
+                        className="llm-btn dropup"
+                        helperText=""
+                        id="default"
+                        label={translate("chooseLlm")}
+                        onChange={function noRefCheck() {}}
+                        options={llmList.map((item) => {
+                          return {
+                            label: item.model_name,
+                            value: item.id.toString(),
+                          };
+                        })}
+                        placeholder="Choose a Fruit"
+                        selected={
+                          selectedLlm.id ? selectedLlm.id.toString() : ""
+                        }
+                      />
+                    </div>
+                  )}
+                  <div className="count">
+                    <button
+                      disabled={!selectedLlm.id}
+                      type="button"
+                      className="btn btn-primary send-btn"
+                      onClick={handleSend}
+                      onKeyDown={handleKeyDown}
+                    >
+                      <Image source={send} alt="send" />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              <div className="contact-us">
+                <p className="text">
+                  <a
+                    className="text"
+                    href="mailto:Digital.Engineering.Practice.GenAI@sunlife.com?subject=Sun Life Asks"
+                  >
+                    <span className="contact-us-text">
+                      {translate("contactUs")}
+                    </span>{" "}
+                  </a>
+                  {translate("contactUsMessage")}
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <div
+            className={`body-content-right ${
+              isMobile ? "" : "body-content-right-width"
+            }`}
+            hidden={!showContextEditor && isMobile}
+          >
+            <Context
+              doc={doc}
+              undoDoc={undoDoc}
+              redoDoc={redoDoc}
+              setDoc={setDoc}
+              canUndo={canUndo}
+              canRedo={canRedo}
+              save={setContext}
+            />
+          </div>
+        </div>
+      </div>
+      <ModalComponent
+        modalShow={modalShow}
+        closeModal={closeModal}
+        tryAgain={getConfig}
+      />
+    </div>
+  );
+};
+export default GptPlayground;
